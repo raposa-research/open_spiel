@@ -28,17 +28,16 @@
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_bots.h"
 #include "open_spiel/spiel_utils.h"
-#include "pybind11/include/pybind11/cast.h"
-#include "pybind11/include/pybind11/detail/common.h"
-#include "pybind11/include/pybind11/detail/descr.h"
-#include "pybind11/include/pybind11/detail/smart_holder_type_casters.h"
-#include "pybind11/include/pybind11/functional.h"  // IWYU pragma: keep
-#include "pybind11/include/pybind11/numpy.h"  // IWYU pragma: keep
-#include "pybind11/include/pybind11/operators.h"  // IWYU pragma: keep
-#include "pybind11/include/pybind11/pybind11.h"
-#include "pybind11/include/pybind11/pytypes.h"
-#include "pybind11/include/pybind11/smart_holder.h"  // IWYU pragma: keep
-#include "pybind11/include/pybind11/stl.h"  // IWYU pragma: keep
+
+#include "pybind11/cast.h"
+#include "pybind11/functional.h"
+#include "pybind11/numpy.h"
+#include "pybind11/operators.h"
+#include "pybind11/pybind11.h"
+#include "pybind11/pytypes.h"
+#include "pybind11/detail/struct_smart_holder.h"
+#include "pybind11/detail/using_smart_holder.h"
+#include "pybind11/stl.h"
 
 // Runtime errors happen if we're inconsistent about whether or not a type has
 // PYBIND11_SMART_HOLDER_TYPE_CASTERS applied to it or not. So we do it mostly
@@ -70,6 +69,18 @@ class ISMCTSBot;
 
 }  // namespace open_spiel
 
+namespace pybind11 { namespace detail {
+    template <typename T> struct is_smart_holder_type : std::false_type {};
+}}
+
+// Compatibility for OpenSpiel 1.5 + more recent pybind11 changes
+#ifndef PYBIND11_SMART_HOLDER_TYPE_CASTERS
+#define PYBIND11_SMART_HOLDER_TYPE_CASTERS(T) \
+    namespace pybind11 { namespace detail { \
+        template <> struct is_smart_holder_type<T> : std::true_type {}; \
+    } }
+#endif
+
 PYBIND11_SMART_HOLDER_TYPE_CASTERS(open_spiel::State);
 PYBIND11_SMART_HOLDER_TYPE_CASTERS(open_spiel::Game);
 PYBIND11_SMART_HOLDER_TYPE_CASTERS(open_spiel::Policy);
@@ -88,7 +99,7 @@ namespace open_spiel {
 // Trampoline helper class to allow implementing Bots in Python. See
 // https://pybind11.readthedocs.io/en/stable/advanced/classes.html#overriding-virtual-functions-in-python
 template <class BotBase = Bot>
-class PyBot : public BotBase {
+class PyBot : public BotBase, public pybind11::trampoline_self_life_support {
  public:
   // We need the bot constructor
   using BotBase::BotBase;

@@ -1,8 +1,13 @@
 
 # OpenSpiel: A Framework for Reinforcement Learning in Games
 
-[![Documentation Status](https://readthedocs.org/projects/openspiel/badge/?version=latest)](https://openspiel.readthedocs.io/en/latest/?badge=latest)
-![build_and_test](https://github.com/deepmind/open_spiel/workflows/build_and_test/badge.svg)
+![OpenSpiel Base Version](https://img.shields.io/badge/OpenSpiel-v1.5-blue?logo=google-cloud&logoColor=white)
+
+This fork of OpenSpiel v1.5 has been updated to fix compatibility issues with more 
+recent versions of pybind11. The changes are in the default branch `liars-poker` and are 
+written to be used for the `Liar's Poker RNaD` codebase ([here](https://github.com/raposa-research/liars-poker-rnad)). 
+
+## Original Documentation:
 
 OpenSpiel is a collection of environments and algorithms for research in general
 reinforcement learning and search/planning in games. OpenSpiel supports n-player

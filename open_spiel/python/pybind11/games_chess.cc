@@ -22,9 +22,9 @@
 #include "open_spiel/games/chess/chess_board.h"
 #include "open_spiel/games/chess/chess_common.h"
 #include "open_spiel/spiel.h"
-#include "pybind11/include/pybind11/cast.h"
-#include "pybind11/include/pybind11/pybind11.h"
-#include "pybind11/include/pybind11/smart_holder.h"
+#include "pybind11/cast.h"
+#include "pybind11/pybind11.h"
+#include "pybind11/smart_holder.h"
 
 namespace py = ::pybind11;
 using open_spiel::Game;

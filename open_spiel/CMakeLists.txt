@@ -5,6 +5,14 @@
 cmake_minimum_required (VERSION 3.17)
 project (open_spiel)
 
+if(OPEN_SPIEL_PYBIND_PATH)
+    message(STATUS "Root CMake using pybind11 path: ${OPEN_SPIEL_PYBIND_PATH}")
+    include_directories("${OPEN_SPIEL_PYBIND_PATH}/include" "${OPEN_SPIEL_PYBIND_PATH}")
+else()
+    # Standard relative path fallback
+    include_directories("${CMAKE_CURRENT_SOURCE_DIR}/pybind11/include" "${CMAKE_CURRENT_SOURCE_DIR}/pybind11")
+endif()
+
 # Define some nice terminal colors.
 if(NOT WIN32)
   string(ASCII 27 Esc)
@@ -186,6 +194,9 @@ set (OPEN_SPIEL_CORE_FILES
   utils/usage_logging.h
   utils/usage_logging.cc
 )
+
+# to #include pybind files
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../pybind11/include)
 
 # We add the subdirectory here so open_spiel_core can #include absl.
 set(ABSL_PROPAGATE_CXX_STD ON)

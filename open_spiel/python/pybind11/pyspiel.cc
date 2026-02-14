@@ -56,7 +56,7 @@
 #include "open_spiel/tests/basic_tests.h"
 
 // Includes needed for absl::optional.
-#include "pybind11/include/pybind11/detail/common.h"
+#include "pybind11/detail/common.h"
 #include "pybind11_abseil/absl_casters.h"
 
 // List of optional python submodules.

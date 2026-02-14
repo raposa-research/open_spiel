@@ -1,3 +1,11 @@
+if(OPEN_SPIEL_PYBIND_PATH)
+    message(STATUS "Using pybind11 path from setup.py: ${OPEN_SPIEL_PYBIND_PATH}")
+    include_directories("${OPEN_SPIEL_PYBIND_PATH}/include" "${OPEN_SPIEL_PYBIND_PATH}")
+else()
+    # Fallback for people running cmake manually
+    include_directories("../../pybind11/include" "../../pybind11")
+endif()
+
 if (OPEN_SPIEL_BUILDING_WHEEL)
   # When building a wheel, need to use this. See:
   # https://github.com/joerick/cibuildwheel/issues/639#issuecomment-817872369
@@ -75,7 +83,7 @@ endif()
 
 
 # List of all Python bindings to add to pyspiel.
-include_directories (../pybind11_abseil ../../pybind11/include)
+include_directories("../pybind11_abseil" "../../pybind11/include" "../../pybind11")
 set(PYTHON_BINDINGS ${PYTHON_BINDINGS}
   pybind11/algorithms_corr_dist.cc
   pybind11/algorithms_corr_dist.h

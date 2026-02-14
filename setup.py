@@ -80,10 +80,14 @@ class BuildExt(build_ext):
     if os.environ.get("CXX") is not None:
       cxx = os.environ.get("CXX")
     env = os.environ.copy()
+
+    pybind_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "pybind11"))
+    
     cmake_args = [
         f"-DPython3_EXECUTABLE={sys.executable}",
         f"-DCMAKE_CXX_COMPILER={cxx}",
         f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extension_dir}",
+        f"-DOPEN_SPIEL_PYBIND_PATH={pybind_path}",
     ]
     if not os.path.exists(self.build_temp):
       os.makedirs(self.build_temp)
