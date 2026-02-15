@@ -25,8 +25,6 @@ BID_ACTION_OFFSET = 1
 
 _MAX_NUM_PLAYERS = 10
 _MIN_NUM_PLAYERS = 2
-_HAND_LENGTH = 10
-_NUM_DIGITS = 10  # Number of digits to include from the range 1, 2, ..., 9, 0
 _FULL_DECK = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0]
 
 _GAME_TYPE = pyspiel.GameType(
@@ -44,39 +42,43 @@ _GAME_TYPE = pyspiel.GameType(
     provides_observation_string=False,
     provides_observation_tensor=True,
     parameter_specification={
-        "players": _MIN_NUM_PLAYERS,
-        "hand_length": _HAND_LENGTH,
-        "num_digits": _NUM_DIGITS,
+        # allowed parameters and their defaults
+        "players": 2,
+        "hand_length": 8,
+        "num_digits": 10,
     },
 )
-_GAME_INFO = pyspiel.GameInfo(
-    # Num actions = total number of cards * number of digits + action enum
-    num_distinct_actions=_HAND_LENGTH * _NUM_DIGITS * _MIN_NUM_PLAYERS
-    + BID_ACTION_OFFSET,
-    max_chance_outcomes=_HAND_LENGTH * _NUM_DIGITS,
-    num_players=_MIN_NUM_PLAYERS,
-    min_utility=-(
-        _MIN_NUM_PLAYERS - 1
-    ),  # Reward from being challenged and losing.
-    max_utility=_MIN_NUM_PLAYERS
-    - 1,  # Reward for being challenged and winning.
-    utility_sum=0.0,
-    # Number of possible rounds: hand_length * num_digits * num_players
-    # Total moves per round: num_players for non-rebid, num_players-1 for rebid
-    # Max game length: number of possible rounds * total moves per round
-    max_game_length=_HAND_LENGTH * _NUM_DIGITS * _MIN_NUM_PLAYERS**2,
-)
-
 
 class LiarsPoker(pyspiel.Game):
   """A Python version of Liar's poker."""
 
   def __init__(self, params=None):
-    super().__init__(_GAME_TYPE, _GAME_INFO, params or dict())
-    game_parameters = self.get_parameters()
-    self.hand_length = game_parameters.get("hand_length", _HAND_LENGTH)
-    self.num_digits = game_parameters.get("num_digits", _NUM_DIGITS)
+    params = params or {}
+
+    # underscore to handle OpenSpiel expecting a function in num_players
+    self._num_players = params.get("players", 2)
+
+    self.hand_length = params.get("hand_length", 10)
+    self.num_digits = params.get("num_digits", 10)
+
+    num_distinct_actions = (self.num_digits * self.hand_length * self._num_players) + 1
+
+    game_info = pyspiel.GameInfo(
+      num_distinct_actions=num_distinct_actions,
+      max_chance_outcomes=self.hand_length * self.num_digits,
+      num_players=self._num_players,
+      min_utility=self._num_players - 1,
+      max_utility=self._num_players - 1,
+      utility_sum=0.0,
+      max_game_length=self.hand_length * self.num_digits * self._num_players**2,
+    )
+
+    super().__init__(_GAME_TYPE, game_info, params)
+
     self.deck = _FULL_DECK[: self.num_digits]
+
+  def num_players(self):
+    return self._num_players
 
   def new_initial_state(self):
     """Returns a state corresponding to the start of a game."""
@@ -86,7 +88,7 @@ class LiarsPoker(pyspiel.Game):
     """Returns an object used for observing game state."""
     return LiarsPokerObserver(
         iig_obs_type or pyspiel.IIGObservationType(perfect_recall=False),
-        self.num_players(),
+        self._num_players,
         self.hand_length,
         self.num_digits,
         params,
