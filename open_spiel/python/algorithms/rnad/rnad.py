@@ -15,7 +15,7 @@
 
 import enum
 import functools
-from typing import Any, Callable, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import chex
 import haiku as hk
@@ -296,21 +296,25 @@ def legal_log_policy(logits: chex.Array,
 
 
 def _player_others(player_ids: chex.Array, valid: chex.Array,
-                   player: int) -> chex.Array:
-  """A vector of 1 for the current player and -1 for others.
+                   player: int, num_players: int) -> chex.Array:
+  """A vector of 1 for the current player and -1/(N-1) for others.
 
   Args:
     player_ids: Tensor [...] containing player ids (0 <= player_id < N).
     valid: Tensor [...] containing whether these states are valid.
     player: The player id as int.
+    num_players: The total number of players
 
   Returns:
-    player_other: is 1 for the current player and -1 for others [..., 1].
+    player_other: is 1 for the current player and -1/(N-1) for others [..., 1].
   """
   chex.assert_equal_shape((player_ids, valid))
-  current_player_tensor = (player_ids == player).astype(jnp.int32)  # pytype: disable=attribute-error  # numpy-scalars
 
-  res = 2 * current_player_tensor - 1
+  is_player = (player_ids == player).astype(jnp.float32)
+  is_other = 1.0 - is_player
+  num_others = float(num_players - 1)
+
+  res = is_player - is_other / num_others
   res = res * valid
   return jnp.expand_dims(res, axis=-1)
 
@@ -558,32 +562,73 @@ def get_loss_nerd(logit_list: Sequence[chex.Array],
                   legal_actions: chex.Array,
                   importance_sampling_correction: Sequence[chex.Array],
                   clip: float = 100,
-                  threshold: float = 2) -> chex.Array:
+                  threshold: float = 2) -> Tuple[chex.Array, Dict[str, chex.Array]]:
   """Define the nerd loss."""
   assert isinstance(importance_sampling_correction, list)
   loss_pi_list = []
+
+  # Metrics collectors
+  max_adv_list = []
+  mean_adv_list = []
+  adv_clip_frac_list = []
+  max_force_list = []
+  logit_max_list = []
 
   for k, (logit_pi, pi, q_vr, is_c) in enumerate(
       zip(logit_list, policy_list, q_vr_list, importance_sampling_correction)):
     assert logit_pi.shape[0] == q_vr.shape[0]
     # loss policy
     adv_pi = q_vr - jnp.sum(pi * q_vr, axis=-1, keepdims=True)
-    adv_pi = is_c * adv_pi  # importance sampling correction
+
+    # Identify exactly when THIS player is acting
+    acting_mask = valid * (player_ids == k)
+    acting_mask_ext = acting_mask[..., None]  # Expand for broadcasting to actions
+
+    adv_pi = adv_pi * is_c * acting_mask_ext
+
+    # diagnostics >>
+    max_adv_list.append(jnp.max(jnp.abs(adv_pi)))
+    legal_adv_abs = jnp.abs(adv_pi) * legal_actions  # [T, B, A]
+    n_legal_entries = jnp.sum(acting_mask_ext * legal_actions)
+    mean_abs_adv = jnp.sum(legal_adv_abs) / (n_legal_entries + 1e-9)
+    mean_adv_list.append(mean_abs_adv)
+    n_clipped = jnp.sum(
+        (jnp.abs(adv_pi) >= clip * 0.99) * acting_mask_ext * legal_actions
+    )
+    clip_frac = n_clipped / (n_legal_entries + 1e-9)
+    adv_clip_frac_list.append(clip_frac)
+    # << diagnostics
+
     adv_pi = jnp.clip(adv_pi, a_min=-clip, a_max=clip)
     adv_pi = lax.stop_gradient(adv_pi)
 
     logits = logit_pi - jnp.mean(
         logit_pi * legal_actions, axis=-1, keepdims=True)
 
+    # diagnostic
+    logit_max_list.append(jnp.max(jnp.abs(logits * acting_mask_ext)))
+
     threshold_center = jnp.zeros_like(logits)
 
-    nerd_loss = jnp.sum(
-        legal_actions *
-        apply_force_with_threshold(logits, adv_pi, threshold, threshold_center),
-        axis=-1)
+    nerd_force = apply_force_with_threshold(logits, adv_pi, threshold, threshold_center)
+
+    # diagnostic
+    max_force_list.append(jnp.max(jnp.abs(nerd_force * acting_mask_ext)))
+
+    nerd_loss = jnp.sum(legal_actions * nerd_force, axis=-1)
     nerd_loss = -renormalize(nerd_loss, valid * (player_ids == k))
     loss_pi_list.append(nerd_loss)
-  return sum(loss_pi_list)
+
+  # Aggregate metrics across all players
+  metrics = {
+      "nerd_advantage_max": jnp.max(jnp.stack(max_adv_list)),
+      "nerd_advantage_mean": jnp.mean(jnp.stack(mean_adv_list)),
+      "nerd_advantage_clip_frac": jnp.max(jnp.stack(adv_clip_frac_list)),
+      "nerd_force_max": jnp.max(jnp.stack(max_force_list)),
+      "nerd_logit_max": jnp.max(jnp.stack(logit_max_list)),
+  }
+
+  return sum(loss_pi_list), metrics
 
 
 @chex.dataclass(frozen=True)
@@ -751,7 +796,7 @@ class RNaDSolver(policy_lib.Policy):
       mlp_policy_head = hk.nets.MLP([self._game.num_distinct_actions()])
       logit = mlp_policy_head(torso)
 
-      mlp_policy_value = hk.nets.MLP([1])
+      mlp_policy_value = hk.nets.MLP([self._game.num_players()])
       v = mlp_policy_value(torso)
 
       pi = _legal_policy(logit, env_step.legal)
@@ -764,7 +809,7 @@ class RNaDSolver(policy_lib.Policy):
     self._entropy_schedule = EntropySchedule(
         sizes=self.config.entropy_schedule_size,
         repeats=self.config.entropy_schedule_repeats)
-    self._loss_and_grad = jax.value_and_grad(self.loss, has_aux=False)
+    self._loss_and_grad = jax.value_and_grad(self.loss, has_aux=True)
 
     # Create initial parameters.
     env_step = self._state_as_env_step(self._ex_state)
@@ -786,6 +831,148 @@ class RNaDSolver(policy_lib.Policy):
     self.optimizer_target = optax_optimizer(
         self.params_target, optax.sgd(self.config.target_network_avg))
 
+  def gather_diagnostics(
+          self,
+          ts: TimeStep,
+          pi: chex.Array,  # [T, B, A] - current policy
+          v: chex.Array,  # [T, B, P] - value predictions
+          log_pi: chex.Array,  # [T, B, A] - log policy
+          log_policy_reg: chex.Array,  # [T, B, A] - log(pi/pi_reg)
+          loss_v: chex.Array,
+          loss_nerd: chex.Array,
+          nerd_metrics: Dict[str, chex.Array],
+          v_target_list: List[chex.Array],
+          has_played_list: List[chex.Array],
+  ) -> Dict[str, chex.Array]:
+      """Gather all diagnostic metrics for logging."""
+      num_players = self._game.num_players()
+      valid = ts.env.valid  # [T, B]
+      legal = ts.env.legal  # [T, B, A]
+      n_valid = jnp.sum(valid) + 1e-9
+
+      # ======== VALUE DIAGNOSTICS ========
+      value_sum = jnp.sum(jnp.sum(v, axis=-1) * valid) / n_valid
+      value_magnitude = (
+              jnp.sum(jnp.abs(v) * valid[:, :, None]) /
+              (jnp.sum(valid[:, :, None]) + 1e-9)
+      )
+      v_target_magnitudes = [
+          jnp.sum(jnp.abs(vt.squeeze(-1)) * mask) / (jnp.sum(mask) + 1e-9)
+          for vt, mask in zip(v_target_list, has_played_list)
+      ]
+      v_target_magnitude = jnp.mean(jnp.stack(v_target_magnitudes))
+
+      # ======== ENTROPY DIAGNOSTICS ========
+      step_entropy = -jnp.sum(pi * log_pi, axis=-1)  # [T, B]
+      global_entropy = jnp.sum(step_entropy * valid) / n_valid
+
+      # Per-player decision entropy (averaged across players)
+      decision_entropies = []
+      for player in range(num_players):
+          mask_p = valid * (ts.env.player_id == player)
+          ent_p = jnp.sum(step_entropy * mask_p) / (jnp.sum(mask_p) + 1e-9)
+          decision_entropies.append(ent_p)
+      decision_entropy = jnp.mean(jnp.array(decision_entropies))
+
+      # ======== REGULARIZATION DIAGNOSTICS ========
+      kl_per_state = jnp.sum(pi * log_policy_reg, axis=-1)  # [T, B]
+      kl_avg = jnp.sum(kl_per_state * valid) / n_valid
+      kl_max = jnp.max(jnp.abs(kl_per_state) * valid)
+      log_ratio_max = jnp.max(jnp.abs(log_policy_reg) * valid[..., None])
+      log_ratio_legal_mean = jnp.sum(
+          jnp.abs(log_policy_reg) * legal * valid[..., None]
+      ) / (jnp.sum(legal * valid[..., None]) + 1e-9)
+
+      # ======== DEAD ACTION DIAGNOSTICS ========
+      # Actions >= dead_threshold are "dead" (high bids that should rarely be played)
+      dead_threshold = 15  # game-specific: bids 15-27 are dead
+      dead_mask = (jnp.arange(pi.shape[-1]) >= dead_threshold).astype(jnp.float32)
+      dead_legal = legal * dead_mask  # [T, B, A]
+      dead_prob = jnp.sum(pi * dead_legal, axis=-1)  # [T, B]
+      has_dead = (jnp.sum(dead_legal, axis=-1) > 0)  # [T, B]
+      dead_valid = valid * has_dead
+      avg_dead_prob = jnp.sum(dead_prob * dead_valid) / (jnp.sum(dead_valid) + 1e-9)
+
+      # ======== TRAJECTORY EXPLORATION DIAGNOSTICS ========
+      actions = jnp.argmax(ts.actor.action_oh, axis=-1)  # [T, B]
+
+      # --- Trajectory length ---
+      traj_lengths = jnp.sum(valid, axis=0)  # [B]
+      avg_traj_length = jnp.mean(traj_lengths)
+      std_traj_length = jnp.std(traj_lengths)
+
+      # --- Max bid reached per game ---
+      # Action 0 = challenge, actions 1-27 = bids
+      bid_values = actions.astype(jnp.float32) * valid  # 0 for challenge/invalid
+      max_bid_per_game = jnp.max(bid_values, axis=0)  # [B]
+      avg_max_bid = jnp.mean(max_bid_per_game)
+      std_max_bid = jnp.std(max_bid_per_game)
+
+      # --- Empirical action entropy (batch-wide action diversity) ---
+      action_counts = jnp.sum(ts.actor.action_oh * valid[..., None], axis=(0, 1))  # [A]
+      action_dist = action_counts / (jnp.sum(action_counts) + 1e-9)
+      empirical_action_entropy = -jnp.sum(
+          jnp.where(action_dist > 0, action_dist * jnp.log(action_dist + 1e-9), 0.0)
+      )
+
+      # --- Challenge rate (when challenge is legal) ---
+      is_challenge = (actions == 0).astype(jnp.float32)
+      challenge_legal = legal[:, :, 0]  # [T, B]
+      valid_challenge_points = valid * challenge_legal
+      challenge_rate = jnp.sum(is_challenge * valid_challenge_points) / (
+              jnp.sum(valid_challenge_points) + 1e-9
+      )
+
+      # --- Herd rate (batch agreement on most popular action per timestep) ---
+      masked_action_oh = ts.actor.action_oh * valid[..., None]  # [T, B, A]
+      action_counts_per_step = jnp.sum(masked_action_oh, axis=1)  # [T, A]
+      valid_per_step = jnp.sum(valid, axis=1)  # [T]
+      mode_frac = jnp.max(action_counts_per_step, axis=-1) / (valid_per_step + 1e-9)  # [T]
+      active_steps = (valid_per_step > 0).astype(jnp.float32)  # [T]
+      avg_herd_rate = jnp.sum(mode_frac * active_steps) / (jnp.sum(active_steps) + 1e-9)
+
+      # ======== POLICY SHARPNESS ========
+      # Average probability on the top-1 action (complements entropy)
+      top1_prob = jnp.max(pi * legal, axis=-1)  # [T, B]
+      avg_top1_prob = jnp.sum(top1_prob * valid) / n_valid
+
+      return {
+          # Losses
+          "loss_v": loss_v,
+          "loss_nerd": loss_nerd,
+          # Value
+          "value_sum": value_sum,
+          "value_magnitude": value_magnitude,
+          "v_target_magnitude": v_target_magnitude,
+          # Entropy
+          "decision_entropy": decision_entropy,
+          "global_entropy": global_entropy,
+          # NeuRD (pass-through from get_loss_nerd)
+          "nerd_advantage_max": nerd_metrics["nerd_advantage_max"],
+          "nerd_advantage_mean": nerd_metrics["nerd_advantage_mean"],
+          "nerd_advantage_clip_frac": nerd_metrics["nerd_advantage_clip_frac"],
+          "nerd_force_max": nerd_metrics["nerd_force_max"],
+          "nerd_logit_max": nerd_metrics["nerd_logit_max"],
+          # Regularization
+          "kl_from_prev_avg": kl_avg,
+          "kl_from_prev_max": kl_max,
+          "log_ratio_max": log_ratio_max,
+          "log_ratio_legal_mean": log_ratio_legal_mean,
+          # Dead actions
+          "avg_dead_prob": avg_dead_prob,
+          # Trajectory exploration
+          "avg_traj_length": avg_traj_length,
+          "std_traj_length": std_traj_length,
+          "avg_max_bid": avg_max_bid,
+          "std_max_bid": std_max_bid,
+          "empirical_action_entropy": empirical_action_entropy,
+          "challenge_rate": challenge_rate,
+          "avg_herd_rate": avg_herd_rate,
+          # Policy sharpness
+          "avg_top1_prob": avg_top1_prob,
+      }
+
+
   def loss(self, params: Params, params_target: Params, params_prev: Params,
            params_prev_: Params, ts: TimeStep, alpha: float,
            learner_steps: int) -> float:
@@ -803,17 +990,18 @@ class RNaDSolver(policy_lib.Policy):
     # parametrised by alpha.
     log_policy_reg = log_pi - (alpha * log_pi_prev + (1 - alpha) * log_pi_prev_)
 
+    num_players = self._game.num_players()
     v_target_list, has_played_list, v_trace_policy_target_list = [], [], []
-    for player in range(self._game.num_players()):
+    for player in range(num_players):
       reward = ts.actor.rewards[:, :, player]  # [T, B, Player]
       v_target_, has_played, policy_target_ = v_trace(
-          v_target,
+          v_target[:, :, player:player+1],
           ts.env.valid,
           ts.env.player_id,
           ts.actor.policy,
           policy_pprocessed,
           log_policy_reg,
-          _player_others(ts.env.player_id, ts.env.valid, player),
+          _player_others(ts.env.player_id, ts.env.valid, player, num_players),
           ts.actor.action_oh,
           reward,
           player,
@@ -824,13 +1012,14 @@ class RNaDSolver(policy_lib.Policy):
       v_target_list.append(v_target_)
       has_played_list.append(has_played)
       v_trace_policy_target_list.append(policy_target_)
-    loss_v = get_loss_v([v] * self._game.num_players(), v_target_list,
-                        has_played_list)
+
+    v_list = [v[:, :, p:p + 1] for p in range(num_players)]
+    loss_v = get_loss_v(v_list, v_target_list, has_played_list)
 
     is_vector = jnp.expand_dims(jnp.ones_like(ts.env.valid), axis=-1)
     importance_sampling_correction = [is_vector] * self._game.num_players()
     # Uses v-trace to define q-values for Nerd
-    loss_nerd = get_loss_nerd(
+    loss_nerd, nerd_metrics = get_loss_nerd(
         [logit] * self._game.num_players(), [pi] * self._game.num_players(),
         v_trace_policy_target_list,
         ts.env.valid,
@@ -839,7 +1028,26 @@ class RNaDSolver(policy_lib.Policy):
         importance_sampling_correction,
         clip=self.config.nerd.clip,
         threshold=self.config.nerd.beta)
-    return loss_v + loss_nerd  # pytype: disable=bad-return-type  # numpy-scalars
+
+    metrics = self.gather_diagnostics(
+        ts, pi, v, log_pi, log_policy_reg,
+        loss_v, loss_nerd, nerd_metrics,
+        v_target_list, has_played_list
+    )
+
+    total_loss = loss_v + loss_nerd
+
+    return total_loss, metrics  # pytype: disable=bad-return-type  # numpy-scalars
+
+  @staticmethod
+  def grad_norm(tree):
+      leaves = jax.tree_util.tree_leaves(tree)
+      return jnp.sqrt(sum(jnp.sum(x ** 2) for x in leaves))
+
+  @staticmethod
+  def grad_max(tree):
+      leaves = jax.tree_util.tree_leaves(tree)
+      return jnp.max(jnp.array([jnp.max(jnp.abs(x)) for x in leaves]))
 
   @functools.partial(jax.jit, static_argnums=(0,))
   def update_parameters(
@@ -855,7 +1063,7 @@ class RNaDSolver(policy_lib.Policy):
       learner_steps: int,
       update_target_net: bool):
     """A jitted pure-functional part of the `step`."""
-    loss_val, grad = self._loss_and_grad(params, params_target, params_prev,
+    (loss_val, metrics), grad = self._loss_and_grad(params, params_target, params_prev,
                                          params_prev_, timestep, alpha,
                                          learner_steps)
     # Update `params`` using the computed gradient.
@@ -874,7 +1082,12 @@ class RNaDSolver(policy_lib.Policy):
 
     logs = {
         "loss": loss_val,
+        "entropy_schedule_alpha": alpha,
+        "grad_L2": self.grad_norm(grad),
+        "grad_max": self.grad_max(grad),
     }
+    logs.update(metrics)
+
     return (params, params_target, params_prev, params_prev_, optimizer,
             optimizer_target), logs
 
