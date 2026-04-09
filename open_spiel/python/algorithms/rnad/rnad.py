@@ -643,7 +643,7 @@ class AdamConfig:
 class NerdConfig:
   """Nerd related params."""
   beta: float = 2.0
-  clip: float = 10_000
+  clip: float = 10
 
 
 class StateRepresentation(str, enum.Enum):
@@ -788,10 +788,36 @@ class RNaDSolver(policy_lib.Policy):
     def network(
         env_step: EnvStep
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+      # Configuration parameters
+      N = self._game.num_players()
+      H = self._game.hand_length
+      D = self._game.num_digits
+
+      # 1. Slice the observation vector
+      # prefix: indices [0 : N]
+      # hand: indices [N : N+H]
+      # suffix: indices [N+H : ]
+      prefix = env_step.obs[..., :N]
+      raw_hand = env_step.obs[..., N: N + H]
+      suffix = env_step.obs[..., N + H:]
+
+      # 2. Convert hand to Bag of Digits
+      # We cast to int32 and subtract 1 (to map 1...D to 0...D-1 for one_hot)
+      # Shape: (..., H, D)
+      hand_one_hot = jax.nn.one_hot(raw_hand.astype(jnp.int32) - 1, num_classes=D)
+
+      # Sum over the hand dimension (H) to get counts
+      # Shape: (..., D)
+      hand_bag = jnp.sum(hand_one_hot, axis=-2)
+
+      # 3. Reconstruct the observation
+      # The new observation length is N + D + len(suffix)
+      processed_obs = jnp.concatenate([prefix, hand_bag, suffix], axis=-1)
+
       mlp_torso = hk.nets.MLP(
           self.config.policy_network_layers, activate_final=True
       )
-      torso = mlp_torso(env_step.obs)
+      torso = mlp_torso(processed_obs)
 
       mlp_policy_head = hk.nets.MLP([self._game.num_distinct_actions()])
       logit = mlp_policy_head(torso)
@@ -1142,6 +1168,10 @@ class RNaDSolver(policy_lib.Policy):
   def step(self):
     """One step of the algorithm, that plays the game and improves params."""
     timestep = self.collect_batch_trajectory()
+
+    returns_per_game = np.sum(timestep.actor.rewards, axis=0)
+    batch_rewards = np.mean(returns_per_game, axis=0)
+
     alpha, update_target_net = self._entropy_schedule(self.learner_steps)
     (self.params, self.params_target, self.params_prev, self.params_prev_,
      self.optimizer, self.optimizer_target), logs = self.update_parameters(
@@ -1152,6 +1182,9 @@ class RNaDSolver(policy_lib.Policy):
     logs.update({
         "actor_steps": self.actor_steps,
         "learner_steps": self.learner_steps,
+        "avg_reward_p0": float(batch_rewards[0]),
+        "avg_reward_p1": float(batch_rewards[1]),
+        "avg_reward_p2": float(batch_rewards[2]),
     })
     return logs
 
